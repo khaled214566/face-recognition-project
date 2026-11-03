@@ -17,12 +17,19 @@ import numpy as np
 import onnxruntime
 from insightface.app import FaceAnalysis
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 
 # ──────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────
 DATABASE_PATH = os.path.join(os.path.dirname(__file__), "database.json")
-SIMILARITY_THRESHOLD = 0.7
+SIMILARITY_THRESHOLD = 0.63
 
 # ──────────────────────────────────────────────
 # Initialize InsightFace (once, shared by all operations)
@@ -249,20 +256,332 @@ def register_person():
 
 
 # ──────────────────────────────────────────────
-# Menu option 2: Recognize faces in a video
+# Drawing & Annotation Helpers
 # ──────────────────────────────────────────────
-def recognize_video():
-    """Process an MP4 video and recognize faces against the database."""
-    print("\n--- Recognize Faces in Video ---")
+def draw_annotations(frame, detections):
+    """
+    Draw clean, high-visibility bounding boxes and labels on a frame.
+    detections: list of tuples (bbox, label, is_match)
+    """
+    for bbox, label, is_match in detections:
+        x1, y1, x2, y2 = bbox
+        # Green for registered matches, Red for unknown faces
+        box_color = (40, 200, 40) if is_match else (40, 40, 230)
+
+        # Draw main bounding box with anti-aliasing
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2, lineType=cv2.LINE_AA)
+
+        # Calculate text badge size
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        font_thickness = 1
+        text_size, baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
+        tw, th = text_size
+
+        # Place label above the box if room allows, otherwise inside the top of the box
+        if y1 - th - 8 >= 0:
+            badge_y1 = y1 - th - 8
+            badge_y2 = y1
+            text_y = y1 - 4
+        else:
+            badge_y1 = y1
+            badge_y2 = y1 + th + 8
+            text_y = y1 + th + 4
+
+        badge_x1 = x1
+        badge_x2 = min(frame.shape[1] - 1, x1 + tw + 8)
+
+        # Draw filled label background
+        cv2.rectangle(frame, (badge_x1, badge_y1), (badge_x2, badge_y2), box_color, -1)
+
+        # Draw label text
+        cv2.putText(
+            frame,
+            label,
+            (badge_x1 + 4, text_y),
+            font,
+            font_scale,
+            (255, 255, 255),
+            font_thickness,
+            lineType=cv2.LINE_AA,
+        )
+
+
+def preserve_audio_if_present(source_video, exported_video):
+    """
+    If the source video has an audio track and ffmpeg is installed,
+    mux the original audio into the exported video file without re-encoding video.
+    """
+    try:
+        # Check if source video contains an audio stream
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type", "-of", "csv=p=0", source_video],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if "audio" not in probe.stdout.lower():
+            return exported_video
+
+        # Temporary filename for muxing
+        base, ext = os.path.splitext(exported_video)
+        temp_muxed = f"{base}_muxed{ext}"
+
+        mux_cmd = [
+            "ffmpeg", "-y",
+            "-i", exported_video,
+            "-i", source_video,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+            "-shortest",
+            temp_muxed
+        ]
+        res = subprocess.run(mux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if res.returncode == 0 and os.path.exists(temp_muxed) and os.path.getsize(temp_muxed) > 0:
+            os.replace(temp_muxed, exported_video)
+    except Exception:
+        # If muxing fails, keep the OpenCV-generated video file
+        pass
+    return exported_video
+
+
+# ──────────────────────────────────────────────
+# Menu option 2: Process video and export to file (Batch mode)
+# ──────────────────────────────────────────────
+def process_and_export_video():
+    """
+    Read an input video, run face recognition frame-by-frame,
+    and export the fully annotated video into a new file.
+    """
+    print("\n" + "=" * 50)
+    print("   PROCESS VIDEO & EXPORT TO NEW FILE")
+    print("=" * 50)
 
     db = load_database()
     if not db:
         print("Error: Database is empty. Register at least one person first.")
         return
 
-    video_path = input("Enter the path to the MP4 video: ").strip()
-    video_path = video_path.strip('"').strip("'")
+    # Check for available videos in the current folder to suggest
+    base_dir = os.path.dirname(__file__)
+    supported_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    nearby_videos = [
+        f for f in sorted(os.listdir(base_dir))
+        if os.path.splitext(f)[1].lower() in supported_exts and not f.endswith("_recognized.mp4")
+    ]
+    if nearby_videos:
+        print("Videos found in project directory:")
+        for idx, v in enumerate(nearby_videos, 1):
+            print(f"  [{idx}] {v}")
 
+    video_input = input("\nEnter video path or number (or press Enter for default): ").strip().strip('"').strip("'")
+    if not video_input and nearby_videos:
+        video_path = os.path.join(base_dir, nearby_videos[0])
+    elif video_input.isdigit() and 1 <= int(video_input) <= len(nearby_videos):
+        video_path = os.path.join(base_dir, nearby_videos[int(video_input) - 1])
+    else:
+        video_path = video_input
+
+    if not os.path.exists(video_path):
+        print(f"Error: File not found: '{video_path}'")
+        return
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video: '{video_path}'")
+        return
+
+    # Video properties
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or np.isnan(fps):
+        fps = 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration_sec = total_frames / fps if fps > 0 else 0
+
+    print(f"\nSource Video Information:")
+    print(f"  File       : {os.path.basename(video_path)}")
+    print(f"  Resolution : {width}x{height}")
+    print(f"  FPS        : {fps:.2f}")
+    print(f"  Frames     : {total_frames} (~{duration_sec:.1f} seconds)")
+
+    # Output path suggestion
+    dir_name = os.path.dirname(os.path.abspath(video_path))
+    file_stem = os.path.splitext(os.path.basename(video_path))[0]
+    default_output = os.path.join(dir_name, f"{file_stem}_recognized.mp4")
+
+    out_prompt = input(f"\nOutput path [Press Enter for '{os.path.basename(default_output)}']: ").strip().strip('"').strip("'")
+    output_path = out_prompt if out_prompt else default_output
+
+    # Performance setting: detection stride
+    print("\nProcessing Speed Preset:")
+    print("  1. Fast (detect every 3 frames — recommended, smooth & ~3x faster)")
+    print("  2. Balanced (detect every 2 frames)")
+    print("  3. Maximum precision (detect every single frame — slowest)")
+    stride_choice = input("Choice (1-3, default=1): ").strip()
+    if stride_choice == "2":
+        detect_every_n = 2
+    elif stride_choice == "3":
+        detect_every_n = 1
+    else:
+        detect_every_n = 3
+
+    # Live preview option
+    preview_prompt = input("Show live preview window while exporting? (y/N) [N is faster]: ").strip().lower()
+    show_preview = preview_prompt in ("y", "yes")
+
+    # Set up VideoWriter
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    if not out.isOpened():
+        print("Warning: mp4v codec failed. Trying XVID fallback...")
+        output_path = os.path.splitext(output_path)[0] + ".avi"
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not out.isOpened():
+            print(f"Error: Unable to initialize VideoWriter for '{output_path}'.")
+            cap.release()
+            return
+
+    print(f"\nExporting to: {output_path}")
+    print("Working... Press Ctrl+C in terminal (or 'q' in preview window) to cancel.\n")
+
+    frame_idx = 0
+    start_time = time.time()
+    last_results = []
+    detections_summary = {}
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Face detection every N frames
+            if frame_idx % detect_every_n == 0:
+                faces = face_app.get(frame)
+                last_results = []
+
+                for face in faces:
+                    bbox = face.bbox.astype(int)
+                    embedding = face.normed_embedding
+                    matched_name, similarity = find_best_match(embedding, db)
+
+                    if matched_name:
+                        label = f"{matched_name} ({similarity:.2f})"
+                        last_results.append((bbox, label, True))
+                        detections_summary[matched_name] = detections_summary.get(matched_name, 0) + 1
+                    else:
+                        label = f"UNKNOWN ({similarity:.2f})"
+                        last_results.append((bbox, label, False))
+                        detections_summary["UNKNOWN"] = detections_summary.get("UNKNOWN", 0) + 1
+
+            # Draw annotations on the frame
+            draw_annotations(frame, last_results)
+
+            # Write to output video
+            out.write(frame)
+            frame_idx += 1
+
+            # Terminal progress bar update
+            elapsed = time.time() - start_time
+            current_fps = frame_idx / elapsed if elapsed > 0 else 0
+            remaining = (total_frames - frame_idx) / current_fps if current_fps > 0 and total_frames > frame_idx else 0
+            eta_str = f"{int(remaining)}s" if remaining < 60 else f"{int(remaining // 60)}m{int(remaining % 60):02d}s"
+
+            bar_len = 25
+            progress_ratio = frame_idx / total_frames if total_frames > 0 else 1.0
+            filled = int(bar_len * progress_ratio)
+            if filled >= bar_len:
+                bar = "=" * bar_len
+            elif filled > 0:
+                bar = "=" * (filled - 1) + ">" + " " * (bar_len - filled)
+            else:
+                bar = " " * bar_len
+
+            status_note = ""
+            if last_results:
+                top_match = last_results[0][1]
+                status_note = f"| {top_match}"
+
+            sys.stdout.write(
+                f"\r  [{bar}] {progress_ratio * 100:5.1f}% ({frame_idx}/{total_frames}) | "
+                f"{current_fps:4.1f} FPS | ETA: {eta_str} {status_note:<24}"
+            )
+            sys.stdout.flush()
+
+            # Optional live preview
+            if show_preview:
+                cv2.imshow("Export Preview (Press 'q' to stop)", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("\n\nExport stopped early by user.")
+                    break
+
+    except KeyboardInterrupt:
+        print("\n\nExport interrupted by user.")
+    finally:
+        cap.release()
+        out.release()
+        if show_preview:
+            cv2.destroyAllWindows()
+
+    total_time = time.time() - start_time
+    avg_fps = frame_idx / total_time if total_time > 0 else 0
+    sys.stdout.write("\n")
+
+    if frame_idx == 0:
+        print("No frames were processed.")
+        return
+
+    # Preserve audio if present
+    print("Checking audio streams...")
+    final_output = preserve_audio_if_present(video_path, output_path)
+
+    file_size_mb = os.path.getsize(final_output) / (1024 * 1024) if os.path.exists(final_output) else 0
+
+    print("\n" + "=" * 50)
+    print("   EXPORT COMPLETE!")
+    print("=" * 50)
+    print(f"  Output File     : {final_output}")
+    print(f"  File Size       : {file_size_mb:.2f} MB")
+    print(f"  Frames Written  : {frame_idx} / {total_frames}")
+    print(f"  Time Elapsed    : {total_time:.1f} seconds")
+    print(f"  Avg Process Speed: {avg_fps:.1f} FPS")
+
+    if detections_summary:
+        print("\n  Detections Summary:")
+        for name, count in sorted(detections_summary.items(), key=lambda x: x[1], reverse=True):
+            print(f"    - {name}: detected in {count} analyzed frames")
+    else:
+        print("\n  No faces detected in the video.")
+    print("=" * 50)
+
+    # Prompt to open exported video
+    open_choice = input("\nWould you like to open the exported video now? (Y/n): ").strip().lower()
+    if open_choice in ("", "y", "yes"):
+        try:
+            os.startfile(final_output)
+        except Exception as e:
+            print(f"Note: Could not automatically launch player: {e}")
+
+
+# ──────────────────────────────────────────────
+# Menu option 3: Live real-time video preview
+# ──────────────────────────────────────────────
+def recognize_video_live():
+    """Live interactive preview of face recognition on video playback."""
+    print("\n--- Live Video Recognition Preview ---")
+
+    db = load_database()
+    if not db:
+        print("Error: Database is empty. Register at least one person first.")
+        return
+
+    video_path = input("Enter the path to the MP4 video: ").strip().strip('"').strip("'")
     if not os.path.exists(video_path):
         print(f"Error: File not found: {video_path}")
         return
@@ -272,20 +591,18 @@ def recognize_video():
         print(f"Error: Could not open video: {video_path}")
         return
 
-    # Get video properties
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    delay = int(1000 / fps) if fps > 0 else 30  # ms between frames
+    delay = int(1000 / fps) if fps > 0 else 30
 
     print(f"Playing video: {video_path}")
     print(f"  FPS    : {fps:.1f}")
     print(f"  Frames : {total_frames}")
-    print("  Press 'q' to quit.\n")
+    print("  Press 'q' in the window to quit.\n")
 
-    # Process every Nth frame for speed (detect every 3 frames, draw on all)
-    DETECT_EVERY_N = 5
+    DETECT_EVERY_N = 3
     frame_idx = 0
-    last_results = []  # Cache of (bbox, name, similarity) from last detection
+    last_results = []
 
     while True:
         ret, frame = cap.read()
@@ -293,15 +610,12 @@ def recognize_video():
             break
 
         if frame_idx % DETECT_EVERY_N == 0:
-            # Run face detection and recognition on this frame
             faces = face_app.get(frame)
             last_results = []
-
             for face in faces:
-                bbox = face.bbox.astype(int)  # [x1, y1, x2, y2]
+                bbox = face.bbox.astype(int)
                 embedding = face.normed_embedding
                 matched_name, similarity = find_best_match(embedding, db)
-
                 if matched_name:
                     label = f"{matched_name} ({similarity:.2f})"
                     last_results.append((bbox, label, True))
@@ -309,54 +623,21 @@ def recognize_video():
                     label = f"UNKNOWN ({similarity:.2f})"
                     last_results.append((bbox, label, False))
 
-                # Print to terminal
-                timestamp = frame_idx / fps if fps > 0 else 0
-                print(f"  [{timestamp:>7.2f}s] Frame {frame_idx:>5d}: {label}")
-
-        # Draw bounding boxes and labels on the frame
-        for bbox, label, is_match in last_results:
-            x1, y1, x2, y2 = bbox
-            color = (0, 200, 0) if is_match else (0, 0, 255)  # Green = match, Red = unknown
-
-            # Draw bounding box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            # Draw label background
-            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            cv2.rectangle(
-                frame,
-                (x1, y1 - text_size[1] - 10),
-                (x1 + text_size[0] + 4, y1),
-                color,
-                -1,
-            )
-            # Draw label text
-            cv2.putText(
-                frame,
-                label,
-                (x1 + 2, y1 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
-
-        # Show the frame in a window
-        cv2.imshow("Face Recognition", frame)
+        draw_annotations(frame, last_results)
+        cv2.imshow("Live Face Recognition (Press 'q' to quit)", frame)
         frame_idx += 1
 
-        # Press 'q' to quit early
         if cv2.waitKey(delay) & 0xFF == ord("q"):
-            print("\n  Playback stopped by user.")
+            print("\nPlayback stopped by user.")
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    print(f"\nDone! Played {frame_idx} frames.")
+    print(f"Finished preview after {frame_idx} frames.")
 
 
 # ──────────────────────────────────────────────
-# Menu option 3: List registered people
+# Menu option 4: List registered people
 # ──────────────────────────────────────────────
 def list_registered():
     """List all people in the database."""
@@ -377,29 +658,33 @@ def list_registered():
 def main():
     """Run the interactive menu."""
     while True:
-        print("\n" + "=" * 40)
-        print("   FACE RECOGNITION SYSTEM")
-        print("=" * 40)
+        print("\n" + "=" * 44)
+        print("         FACE RECOGNITION SYSTEM")
+        print("=" * 44)
         print("  1. Register a person")
-        print("  2. Recognize faces in a video")
-        print("  3. List registered people")
-        print("  4. Exit")
-        print("=" * 40)
+        print("  2. Process video and export to new file (Recommended)")
+        print("  3. Live video playback preview")
+        print("  4. List registered people")
+        print("  5. Exit")
+        print("=" * 44)
 
-        choice = input("Choose an option (1-4): ").strip()
+        choice = input("Choose an option (1-5): ").strip()
 
         if choice == "1":
             register_person()
         elif choice == "2":
-            recognize_video()
+            process_and_export_video()
         elif choice == "3":
-            list_registered()
+            recognize_video_live()
         elif choice == "4":
+            list_registered()
+        elif choice == "5":
             print("Goodbye!")
             sys.exit(0)
         else:
-            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+            print("Invalid choice. Please enter 1, 2, 3, 4, or 5.")
 
 
 if __name__ == "__main__":
     main()
+
